@@ -1,0 +1,147 @@
+name: Deploy Frontend
+
+on:
+  push:
+    branches:
+      - main
+
+  # 允许在 GitHub Actions 页面手动执行
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: npm ci
+
+      # 4. 构建 Vue3
+      - name: Build frontend
+        run: npm run build
+
+      # 5. 检查构建结果
+      - name: Check build result
+        run: |
+          echo "===== dist ====="
+          ls -lah dist
+
+      # 6. 打包部署需要的文件
+      - name: Package deployment files
+        run: |
+          tar -czf frontend-release.tar.gz \
+            dist \
+            Dockerfile \
+            nginx.conf
+
+      # 7. 配置 SSH
+      - name: Configure SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_ed25519
+
+          chmod 600 ~/.ssh/id_ed25519
+
+          ssh-keyscan \
+            -p "$SERVER_PORT" \
+            -H "$SERVER_HOST" \
+            >> ~/.ssh/known_hosts
+
+      # 8. 上传到服务器
+      - name: Upload deployment files
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          scp \
+            -P "$SERVER_PORT" \
+            frontend-release.tar.gz \
+            "$SERVER_USER@$SERVER_HOST:/tmp/frontend-release.tar.gz"
+
+      # 9. 登录服务器进行 Docker 部署
+      - name: Deploy frontend
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" << 'EOF'
+
+            set -e
+
+            echo "===== Prepare deploy directory ====="
+
+            mkdir -p /opt/knowledge-review-frontend
+
+            rm -rf /opt/knowledge-review-frontend/*
+
+
+            echo "===== Extract frontend ====="
+
+            tar \
+              -xzf /tmp/frontend-release.tar.gz \
+              -C /opt/knowledge-review-frontend
+
+
+            echo "===== Build Docker image ====="
+
+            cd /opt/knowledge-review-frontend
+
+            docker build \
+              -t knowledge-review-frontend:latest \
+              .
+
+
+            echo "===== Remove old container ====="
+
+            docker rm \
+              -f \
+              knowledge-review-frontend \
+              2>/dev/null || true
+
+
+            echo "===== Start new container ====="
+
+            docker run \
+              -d \
+              --name knowledge-review-frontend \
+              --restart unless-stopped \
+              -p 8081:80 \
+              knowledge-review-frontend:latest
+
+
+            echo "===== Container status ====="
+
+            docker ps \
+              --filter "name=knowledge-review-frontend"
+
+
+            echo "===== Cleanup ====="
+
+            rm -f /tmp/frontend-release.tar.gz
+
+          EOF
