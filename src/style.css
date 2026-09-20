@@ -28,6 +28,7 @@ body {
   color: var(--color-text);
   background: linear-gradient(160deg, #eef2ff 0%, #f8fafc 45%, #e0e7ff 100%);
   -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
 }
 
 .card {
