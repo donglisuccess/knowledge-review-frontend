@@ -24,7 +24,7 @@ const {
 <template>
   <div class="page">
     <header class="page-header">
-      <h1>📚 Day Day Up</h1>
+      <h1>📚 Day Day Up, green</h1>
       <p class="subtitle">Vue3 / TypeScript / JavaScript / 工程化 前端知识巩固，备战全能型人才</p>
     </header>
 

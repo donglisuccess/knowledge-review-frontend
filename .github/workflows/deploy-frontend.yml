@@ -5,7 +5,6 @@ on:
     branches:
       - main
 
-  # 允许在 GitHub Actions 页面手动执行
   workflow_dispatch:
 
 permissions:
@@ -32,11 +31,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # 4. 构建 Vue3 项目
+      # 4. 构建 Vue
       - name: Build frontend
         run: npm run build
 
-      # 5. 检查构建结果
+      # 5. 检查 dist
       - name: Check build result
         run: |
           echo "===== dist ====="
@@ -68,7 +67,7 @@ jobs:
             -H "$SERVER_HOST" \
             >> ~/.ssh/known_hosts
 
-      # 8. 上传构建产物
+      # 8. 上传部署文件
       - name: Upload deployment files
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
@@ -80,78 +79,299 @@ jobs:
             frontend-release.tar.gz \
             "$SERVER_USER@$SERVER_HOST:/tmp/frontend-release.tar.gz"
 
-      # 9. 登录服务器并部署
-      - name: Deploy frontend
+      # 9. 蓝绿部署
+      - name: Blue Green Deploy
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
+
         run: |
           ssh \
+            -T \
             -p "$SERVER_PORT" \
-            "$SERVER_USER@$SERVER_HOST" << 'EOF'
+            "$SERVER_USER@$SERVER_HOST" \
+            "DEPLOY_SHA=$GITHUB_SHA bash -s" << 'EOF'
 
             set -e
 
-            echo "===== 1. Prepare deploy directory ====="
+            DEPLOY_DIR="/root/fullstack/frontend"
 
-            mkdir -p /root/fullstack/frontend
+            NGINX_CONF="/etc/nginx/conf.d/frontend.conf"
+
+            BLUE_PORT="8081"
+            GREEN_PORT="8082"
+
+            BLUE_CONTAINER="knowledge-review-frontend-blue"
+            GREEN_CONTAINER="knowledge-review-frontend-green"
 
 
-            echo "===== 2. Remove old dist ====="
+            echo "======================================"
+            echo "1. Prepare deploy directory"
+            echo "======================================"
 
-            rm -rf /root/fullstack/frontend/dist
+            mkdir -p "$DEPLOY_DIR"
 
 
-            echo "===== 3. Extract new frontend files ====="
+            echo "======================================"
+            echo "2. Extract frontend files"
+            echo "======================================"
+
+            rm -rf "$DEPLOY_DIR/dist"
 
             tar \
               -xzf /tmp/frontend-release.tar.gz \
-              -C /root/fullstack/frontend
+              -C "$DEPLOY_DIR"
 
 
-            echo "===== 4. Check frontend files ====="
+            echo "======================================"
+            echo "3. Check frontend files"
+            echo "======================================"
 
-            ls -lah /root/fullstack/frontend
+            ls -lah "$DEPLOY_DIR"
+            ls -lah "$DEPLOY_DIR/dist"
 
-            ls -lah /root/fullstack/frontend/dist
+
+            echo "======================================"
+            echo "4. Check current active port"
+            echo "======================================"
+
+            if [ ! -f "$NGINX_CONF" ]; then
+              echo "ERROR: $NGINX_CONF does not exist"
+              exit 1
+            fi
 
 
-            echo "===== 5. Build Docker image ====="
+            if grep -q "server 127.0.0.1:8081;" "$NGINX_CONF"; then
 
-            cd /root/fullstack/frontend
+              ACTIVE_PORT="$BLUE_PORT"
+              ACTIVE_CONTAINER="$BLUE_CONTAINER"
+
+              NEW_PORT="$GREEN_PORT"
+              NEW_CONTAINER="$GREEN_CONTAINER"
+
+            elif grep -q "server 127.0.0.1:8082;" "$NGINX_CONF"; then
+
+              ACTIVE_PORT="$GREEN_PORT"
+              ACTIVE_CONTAINER="$GREEN_CONTAINER"
+
+              NEW_PORT="$BLUE_PORT"
+              NEW_CONTAINER="$BLUE_CONTAINER"
+
+            else
+
+              echo "ERROR: Cannot determine active frontend port"
+              echo "Expected 8081 or 8082 in:"
+              echo "$NGINX_CONF"
+
+              exit 1
+            fi
+
+
+            echo "Current active:"
+            echo "  container = $ACTIVE_CONTAINER"
+            echo "  port      = $ACTIVE_PORT"
+
+            echo "New deployment:"
+            echo "  container = $NEW_CONTAINER"
+            echo "  port      = $NEW_PORT"
+
+
+            echo "======================================"
+            echo "5. Build new Docker image"
+            echo "======================================"
+
+            cd "$DEPLOY_DIR"
 
             docker build \
+              -t "knowledge-review-frontend:$DEPLOY_SHA" \
               -t knowledge-review-frontend:latest \
               .
 
 
-            echo "===== 6. Remove old container ====="
+            echo "======================================"
+            echo "6. Remove old inactive container"
+            echo "======================================"
 
             docker rm \
               -f \
-              knowledge-review-frontend \
+              "$NEW_CONTAINER" \
               2>/dev/null || true
 
 
-            echo "===== 7. Start new container ====="
+            echo "======================================"
+            echo "7. Start new container"
+            echo "======================================"
 
             docker run \
               -d \
-              --name knowledge-review-frontend \
+              --name "$NEW_CONTAINER" \
               --restart unless-stopped \
-              -p 8081:80 \
-              knowledge-review-frontend:latest
+              -p "127.0.0.1:$NEW_PORT:80" \
+              "knowledge-review-frontend:$DEPLOY_SHA"
 
 
-            echo "===== 8. Check container ====="
+            echo "======================================"
+            echo "8. Health check"
+            echo "======================================"
+
+            HEALTHY=false
+
+            for i in $(seq 1 100)
+            do
+
+              echo "Health check $i/30..."
+
+              if curl \
+                -fsS \
+                --max-time 3 \
+                "http://127.0.0.1:$NEW_PORT/" \
+                > /dev/null
+              then
+
+                HEALTHY=true
+
+                echo "New container is healthy."
+
+                break
+              fi
+
+              sleep 3
+
+            done
+
+
+            if [ "$HEALTHY" != "true" ]; then
+
+              echo "ERROR: New container health check failed"
+
+              echo "===== Container logs ====="
+
+              docker logs "$NEW_CONTAINER" || true
+
+              echo "===== Remove failed container ====="
+
+              docker rm -f "$NEW_CONTAINER" || true
+
+              exit 1
+
+            fi
+
+
+            echo "======================================"
+            echo "9. Backup Nginx config"
+            echo "======================================"
+
+            cp \
+              "$NGINX_CONF" \
+              "${NGINX_CONF}.bak"
+
+
+            echo "======================================"
+            echo "10. Switch Nginx traffic"
+            echo "======================================"
+
+            sed \
+              -i \
+              "s/server 127.0.0.1:$ACTIVE_PORT;/server 127.0.0.1:$NEW_PORT;/" \
+              "$NGINX_CONF"
+
+
+            echo "New upstream:"
+
+            grep "server 127.0.0.1:" "$NGINX_CONF"
+
+
+            echo "======================================"
+            echo "11. Check Nginx config"
+            echo "======================================"
+
+            if ! nginx -t
+            then
+
+              echo "ERROR: nginx configuration test failed"
+
+              echo "Restore old configuration"
+
+              cp \
+                "${NGINX_CONF}.bak" \
+                "$NGINX_CONF"
+
+              docker rm -f "$NEW_CONTAINER" || true
+
+              exit 1
+
+            fi
+
+
+            echo "======================================"
+            echo "12. Reload Nginx"
+            echo "======================================"
+
+            nginx -s reload
+
+
+            echo "======================================"
+            echo "13. Verify switched service"
+            echo "======================================"
+
+            sleep 2
+
+            if ! curl \
+              -fsS \
+              --max-time 5 \
+              http://127.0.0.1/ \
+              > /dev/null
+            then
+
+              echo "ERROR: Service check failed after switch"
+
+              echo "Rolling back Nginx..."
+
+              cp \
+                "${NGINX_CONF}.bak" \
+                "$NGINX_CONF"
+
+              nginx -t
+              nginx -s reload
+
+              echo "Traffic rolled back to port $ACTIVE_PORT"
+
+              exit 1
+
+            fi
+
+
+            echo "======================================"
+            echo "14. Deployment successful"
+            echo "======================================"
+
+            echo "Old active container:"
+            echo "  $ACTIVE_CONTAINER : $ACTIVE_PORT"
+
+            echo "New active container:"
+            echo "  $NEW_CONTAINER : $NEW_PORT"
+
+
+            echo "======================================"
+            echo "15. Container status"
+            echo "======================================"
 
             docker ps \
               --filter "name=knowledge-review-frontend"
 
 
-            echo "===== 9. Cleanup ====="
+            echo "======================================"
+            echo "16. Cleanup"
+            echo "======================================"
 
             rm -f /tmp/frontend-release.tar.gz
+
+            rm -f "${NGINX_CONF}.bak"
+
+
+            echo "======================================"
+            echo "Deploy finished"
+            echo "======================================"
 
           EOF
