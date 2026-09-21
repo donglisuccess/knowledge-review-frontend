@@ -320,7 +320,8 @@ jobs:
             if ! curl \
               -fsS \
               --max-time 5 \
-              http://127.0.0.1/ \
+              --resolve dongliwwj.top:443:127.0.0.1 \
+              https://dongliwwj.top/ \
               > /dev/null
             then
 
